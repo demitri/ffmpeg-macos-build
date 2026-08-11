@@ -1,0 +1,4 @@
+# Build artifacts: sources, tarballs, install prefixes, logs
+work/
+*.log
+*.out
