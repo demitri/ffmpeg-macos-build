@@ -34,7 +34,10 @@ try libsvtav1     vsvt.mp4   $SRC_V -c:v libsvtav1 -preset 12
 try libaom-av1    vaom.mkv   $SRC_V -c:v libaom-av1 -cpu-used 8 -usage realtime
 try h264_vtenc    vvth.mp4   $SRC_V -c:v h264_videotoolbox
 try hevc_vtenc    vvtx.mp4   $SRC_V -c:v hevc_videotoolbox -tag:v hvc1
-try prores_vt     vvtp.mov   $SRC_V -c:v prores_videotoolbox
+# Base M1/M2 have no ProRes encode accelerator (M1 Pro/Max and later do),
+# so -allow_sw 1 is required for this to run on all Apple Silicon.
+try prores_vt     vvtp.mov   $SRC_V -c:v prores_videotoolbox -allow_sw 1
+try prores_sw     vprs.mov   $SRC_V -c:v prores_ks
 try libwebp       vweb.webp  $SRC_V -c:v libwebp -frames:v 1
 
 echo "=== audio encoders ==="
