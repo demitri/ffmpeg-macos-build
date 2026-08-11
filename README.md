@@ -8,7 +8,7 @@ Built and verified: FFmpeg 9.0, macOS 26.6, Apple M1, Apple clang 21.
 ## Design
 
 Every codec library is built **static** into one self-contained prefix
-(`prefix/`). Because they are static, they get linked *into* the `ffmpeg`
+(`work/prefix/`). Because they are static, they get linked *into* the `ffmpeg`
 binary, so that prefix never appears at runtime and never needs installing.
 Only `ffmpeg` itself goes to `/usr/local/ffmpeg-<version>`.
 
@@ -19,6 +19,28 @@ since nothing links against them dynamically.
 `/usr/local` is root-owned and sudo is password-gated, so `build-ffmpeg.sh`
 installs into a `DESTDIR` stage and leaves you one `sudo rsync` to run.
 
+## Requirements
+
+Must already be installed — these are *not* built by these scripts:
+
+| Tool | Why / minimum |
+|---|---|
+| Xcode + Command Line Tools | clang, the macOS SDK, and Apple's `/usr/bin/libtool` |
+| bash >= 4 | scripts use `#!/usr/local/bash/bin/bash`; Apple ships 3.2 |
+| cmake | x265, SVT-AV1, aom, libwebp |
+| meson **>= 1.11.0** | fribidi, harfbuzz, fontconfig, dav1d (fontconfig 2.18 sets the floor) |
+| ninja | meson's backend |
+| pkg-config | dependency resolution throughout |
+| autoconf, automake, libtool | packages whose `autogen.sh` runs `autoreconf` |
+| git, curl, tar | fetching sources |
+
+Also expected: `zlib` and `openssl >= 3.0` discoverable via `pkg-config`
+(the scripts look in `/usr/local/zlib` and `/usr/local/openssl`). bzip2, expat
+and iconv come from the macOS SDK.
+
+The FFmpeg source itself is not downloaded by `fetch.sh` — unpack it yourself
+(default location `/usr/local/src/ffmpeg-$FFMPEG_VERSION`).
+
 ## Scripts
 
 Run in order. All are resumable and fail loudly — no step silently skips.
@@ -26,7 +48,7 @@ Run in order. All are resumable and fail loudly — no step silently skips.
 | Script | What it does |
 |---|---|
 | `fetch.sh` | Downloads + extracts all sources. Skips what is already extracted. |
-| `build-deps.sh` | Builds every codec lib. Records `logs/<pkg>.done`; rerunning skips completed packages. |
+| `build-deps.sh` | Builds every codec lib. Records `work/logs/<pkg>.done`; rerunning skips completed packages. |
 | `build-ffmpeg.sh` | Configures/builds/stages ffmpeg. **Asserts every required codec was enabled** and fails if any is missing. |
 | `smoke-test.sh` | Encodes a real sample with each codec. Proves function, not just presence in `-encoders`. |
 
@@ -37,12 +59,11 @@ Run in order. All are resumable and fail loudly — no step silently skips.
 ./build-deps.sh          # ~45-75 min on an 8-core M1
 ./build-ffmpeg.sh
 ./smoke-test.sh
-sudo rsync -a work/ffmpeg-stage/usr/local/ffmpeg-9.0 /usr/local/
+# then install -- see "Installing" below
 ```
 
 All build output goes to `work/` beside the scripts (override with
-`FFBUILD_WORKDIR`). Nothing is written outside the repo except the final
-`sudo rsync`.
+`FFBUILD_WORKDIR`). Nothing is written outside the repo until you install.
 
 Knobs, all optional:
 
@@ -54,6 +75,53 @@ Knobs, all optional:
 | `FFBUILD_WORKDIR` | `<repo>/work` |
 
 To force a package to rebuild, delete its marker: `rm work/logs/<pkg>.done`.
+
+## Installing
+
+`build-ffmpeg.sh` does **not** install. It configures FFmpeg with its real
+final prefix but installs into a `DESTDIR` stage under `work/`, because
+`/usr/local` is root-owned. Publishing it is one privileged command:
+
+```bash
+sudo rsync -a work/ffmpeg-stage/usr/local/ffmpeg-9.0 /usr/local/
+```
+
+That creates `/usr/local/ffmpeg-9.0/{bin,lib,include,share}` and touches
+nothing else. Because the codec libraries are static, the binary has no
+runtime dependency on this repo — `work/` can be deleted afterwards.
+
+### Putting it on PATH
+
+Nothing above changes what `ffmpeg` means on your system; any pre-existing
+`/usr/local/bin/ffmpeg` still wins. Choose one:
+
+```bash
+# Versioned symlink, then add /usr/local/ffmpeg/bin to PATH.
+# Upgrading later is one re-point of this symlink.
+sudo ln -sfn /usr/local/ffmpeg-9.0 /usr/local/ffmpeg
+
+# Or link the binaries directly into an existing PATH dir.
+# Note this displaces any ffmpeg already there.
+sudo ln -sf /usr/local/ffmpeg-9.0/bin/ffmpeg  /usr/local/bin/ffmpeg
+sudo ln -sf /usr/local/ffmpeg-9.0/bin/ffprobe /usr/local/bin/ffprobe
+```
+
+### Verifying
+
+```bash
+/usr/local/ffmpeg-9.0/bin/ffmpeg -version     # expect the full configure line
+./smoke-test.sh /usr/local/ffmpeg-9.0/bin/ffmpeg   # re-run against the installed copy
+```
+
+`smoke-test.sh` takes an optional path argument, so it can validate an
+installed build, not just the staged one.
+
+### Uninstalling
+
+```bash
+sudo rm -rf /usr/local/ffmpeg-9.0
+```
+Plus whichever symlinks you created above.
 
 ## Environment rules
 
@@ -77,8 +145,8 @@ These are enforced by the scripts; breaking them is what causes most failures.
    cd /usr/local/src/ffmpeg-<new>
    ./configure --help | grep -E "enable-lib|videotoolbox|audiotoolbox"
    ```
-4. Bump dependency versions in `fetch.sh` + `versions.txt`, `rm -rf prefix logs/*.done`,
-   rerun. Resolve versions from upstream rather than guessing:
+4. Bump dependency versions in `fetch.sh` + `versions.txt`, then
+   `rm -rf work/prefix work/logs/*.done` and rerun. Resolve versions from upstream rather than guessing:
    ```bash
    curl -s https://api.github.com/repos/<owner>/<repo>/tags?per_page=10 | grep '"name"'
    curl -s "https://code.videolan.org/api/v4/projects/videolan%2Fdav1d/repository/tags"
@@ -96,7 +164,7 @@ These are enforced by the scripts; breaking them is what causes most failures.
   comes first on `PATH` and rejects `-static`. The 8/10/12-bit builds all
   succeed, then the merge fails — verify with:
   ```bash
-  nm -g prefix/lib/libx265.a | grep -c 10bit   # expect thousands, not 0
+  nm -g work/prefix/lib/libx265.a | grep -c 10bit   # expect thousands, not 0
   ```
   (`x265_config.h` does *not* record `LINKED_10BIT`/`LINKED_12BIT`; check the
   symbols or `CMakeCache.txt`, not that header.)
@@ -119,7 +187,7 @@ These are enforced by the scripts; breaking them is what causes most failures.
   fontconfig/harfbuzz/fribidi, yielding a libass that cannot match fonts.
   Always confirm:
   ```bash
-  grep "checking for \(FONTCONFIG\|HARFBUZZ\|FRIBIDI\)" logs/libass-*.log
+  grep "checking for \(FONTCONFIG\|HARFBUZZ\|FRIBIDI\)" work/logs/libass-*.log
   ```
 
 ## Licensing
