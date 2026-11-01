@@ -1,0 +1,411 @@
+#!/usr/bin/env python3
+"""hevc-encode: re-encode SD/low-res MPG/WMV (etc.) to HEVC with libx265, optionally merging.
+
+For each input it samples the video with ffmpeg's idet filter to decide whether the
+material is progressive, interlaced, or mixed (telecined / mixed content). Interlaced
+material is deinterlaced to DOUBLE rate (bwdif send_field) by default, which keeps
+motion smooth. Mixed material is a hard stop until you pick --deint explicitly.
+
+Nothing is ever deleted. Output is written to a hidden .part file and renamed only
+after it has passed verification (full decode without errors, duration within
+tolerance). Failures are collected, printed, and reflected in the exit code.
+
+Examples:
+  hevc-encode --scan *.mpg                      # just report interlacing, encode nothing
+  hevc-encode *.mpg *.wmv                       # one .mkv per input, next to the input
+  hevc-encode --outdir ~/out *.wmv
+  hevc-encode --merge -o episode.mkv part1.mpg part2.mpg part3.mpg
+"""
+import argparse
+import datetime
+import enum
+import json
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+
+OUT_SUFFIXES = {".mkv", ".mp4", ".m4v"}
+
+
+class Fail(Exception):
+    """A job cannot be completed; reported, never swallowed."""
+
+
+class Deint(enum.Enum):
+    AUTO = "auto"
+    PROGRESSIVE = "progressive"
+    INTERLACED = "interlaced"
+    TELECINE = "telecine"
+
+
+class Verdict(enum.Enum):
+    PROGRESSIVE = "progressive"
+    INTERLACED = "interlaced"
+    MIXED = "mixed"
+
+
+@dataclass
+class Probe:
+    path: Path
+    duration: float
+    size: int
+    width: int
+    height: int
+    sar: Fraction
+    fps: Fraction
+    audio_channels: list
+    subtitle_count: int
+    other_streams: int
+
+
+@dataclass
+class Scan:
+    verdict: Verdict
+    order: str  # "tff" or "bff": majority field order among interlaced frames
+    tff: int
+    bff: int
+    prog: int
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"{cmd[0]} exited {r.returncode}: {r.stderr.strip()[-800:]}")
+    return r
+
+
+def to_fraction(s, what, path):
+    try:
+        f = Fraction(s)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return f if f > 0 else None
+
+
+def probe(path):
+    j = json.loads(run(["ffprobe", "-v", "error", "-print_format", "json",
+                        "-show_format", "-show_streams", str(path)]).stdout)
+    streams = j.get("streams", [])
+    vids = [s for s in streams if s.get("codec_type") == "video"
+            and not s.get("disposition", {}).get("attached_pic")]
+    if len(vids) != 1:
+        raise Fail(f"{path.name}: expected exactly 1 video stream, found {len(vids)}")
+    v = vids[0]
+    dur = j.get("format", {}).get("duration")
+    if dur is None:
+        raise Fail(f"{path.name}: container reports no duration")
+    sar_s = str(v.get("sample_aspect_ratio", "1:1"))
+    sar = Fraction(1)
+    if sar_s not in ("N/A", "0:1", ""):
+        a, b = sar_s.split(":")
+        sar = Fraction(int(a), int(b))
+    fps = to_fraction(v.get("avg_frame_rate", ""), "avg_frame_rate", path) \
+        or to_fraction(v.get("r_frame_rate", ""), "r_frame_rate", path)
+    if fps is None:
+        raise Fail(f"{path.name}: cannot determine frame rate")
+    return Probe(
+        path=path, duration=float(dur), size=path.stat().st_size,
+        width=int(v["width"]), height=int(v["height"]), sar=sar, fps=fps,
+        audio_channels=[int(s.get("channels", 2)) for s in streams if s.get("codec_type") == "audio"],
+        subtitle_count=sum(1 for s in streams if s.get("codec_type") == "subtitle"),
+        other_streams=sum(1 for s in streams if s.get("codec_type") not in ("video", "audio", "subtitle")),
+    )
+
+
+IDET_RE = re.compile(r"Multi frame detection:\s*TFF:\s*(\d+)\s*BFF:\s*(\d+)"
+                     r"\s*Progressive:\s*(\d+)\s*Undetermined:\s*(\d+)")
+
+
+def idet_scan(p):
+    """Sample the video with idet at several points; classify the whole file."""
+    if p.duration > 180:
+        starts, frames = [p.duration * f for f in (0.2, 0.5, 0.8)], 600
+    else:
+        starts, frames = [0.0], 1500
+    tff = bff = prog = 0
+    for s in starts:
+        r = run(["ffmpeg", "-hide_banner", "-nostats", "-ss", f"{s:.2f}", "-i", str(p.path),
+                 "-an", "-sn", "-vf", "idet", "-frames:v", str(frames), "-f", "null", "-"])
+        m = IDET_RE.findall(r.stderr)
+        if not m:
+            raise Fail(f"{p.path.name}: idet produced no summary")
+        t, b, pr, _ = map(int, m[-1])
+        tff, bff, prog = tff + t, bff + b, prog + pr
+    det = tff + bff + prog
+    if det < 200:
+        raise Fail(f"{p.path.name}: only {det} classifiable frames sampled; cannot judge interlacing")
+    ifrac = (tff + bff) / det
+    if ifrac >= 0.85:
+        verdict = Verdict.INTERLACED
+    elif ifrac <= 0.10:
+        verdict = Verdict.PROGRESSIVE
+    else:
+        verdict = Verdict.MIXED
+    return Scan(verdict, "tff" if tff >= bff else "bff", tff, bff, prog)
+
+
+def resolve_mode(p, scan, requested):
+    if requested is not Deint.AUTO:
+        return requested
+    if scan.verdict is Verdict.MIXED:
+        raise Fail(f"{p.path.name}: mixed progressive/interlaced frames "
+                   f"(TFF {scan.tff} BFF {scan.bff} prog {scan.prog}) - telecined or mixed material. "
+                   f"Re-run with --deint interlaced|progressive|telecine")
+    return Deint.INTERLACED if scan.verdict is Verdict.INTERLACED else Deint.PROGRESSIVE
+
+
+def deint_filters(mode, order, double):
+    if mode is Deint.PROGRESSIVE:
+        return []
+    if mode is Deint.INTERLACED:
+        m = "send_field" if double else "send_frame"
+        return [f"bwdif=mode={m}:parity={order}:deint=all"]
+    return [f"fieldmatch=order={order}:combmatch=none", "yadif=deint=interlaced", "decimate"]
+
+
+def out_fps(p, mode, double):
+    if mode is Deint.INTERLACED and double:
+        return p.fps * 2
+    if mode is Deint.TELECINE:
+        return p.fps * Fraction(4, 5)
+    return p.fps
+
+
+def check_encoder(eight_bit):
+    out = run(["ffmpeg", "-hide_banner", "-h", "encoder=libx265"]).stdout
+    if "libx265" not in out:
+        raise Fail("this ffmpeg has no libx265 encoder")
+    if not eight_bit and "yuv420p10le" not in out:
+        raise Fail("this ffmpeg's libx265 lacks 10-bit output; re-run with --8bit")
+
+
+def audio_bitrate(channels, override):
+    if override:
+        return override
+    return f"{min(64 * channels, 384)}k"
+
+
+def encode_args(args, abitrate):
+    return ["-c:v", "libx265", "-preset", args.preset, "-crf", str(args.crf),
+            "-x265-params", "aq-mode=3:log-level=error" + (f":pools={args.threads}" if args.threads else ""),
+            "-pix_fmt", "yuv420p" if args.eight_bit else "yuv420p10le",
+            "-tag:v", "hvc1", "-c:a", "aac", "-b:a", abitrate]
+
+
+def run_ffmpeg(cmd):
+    if shutil.which("caffeinate"):
+        cmd = ["caffeinate", "-i"] + cmd
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        raise Fail(f"ffmpeg encode exited {r.returncode}")
+
+
+def verify(out, expected_dur):
+    r = run(["ffmpeg", "-hide_banner", "-v", "error", "-i", str(out), "-f", "null", "-"])
+    if r.stderr.strip():
+        raise Fail(f"decode check of output reported errors: {r.stderr.strip()[-500:]}")
+    pr = probe(out)
+    tol = max(1.0, 0.005 * expected_dur)
+    if abs(pr.duration - expected_dur) > tol:
+        raise Fail(f"output duration {pr.duration:.1f}s vs expected {expected_dur:.1f}s (tolerance {tol:.1f}s)")
+    return pr
+
+
+def parse_size(s):
+    m = re.fullmatch(r"(\d+)x(\d+)", s)
+    if not m:
+        raise Fail(f"--size must look like 640x480, got {s!r}")
+    return int(m[1]), int(m[2])
+
+
+def even(n):
+    return int(n) // 2 * 2
+
+
+def do_job(srcs, out, args):
+    """Encode srcs (1 file, or several to merge) to out. Returns a result row dict."""
+    if out.suffix.lower() not in OUT_SUFFIXES:
+        raise Fail(f"output {out.name}: extension must be one of {sorted(OUT_SUFFIXES)} (HEVC+AAC cannot go in a {out.suffix or 'no-extension'} file)")
+    if out.exists():
+        raise Fail(f"{out} already exists; refusing to overwrite")
+    probes = [probe(s) for s in srcs]
+    for p in probes:
+        if p.subtitle_count:
+            raise Fail(f"{p.path.name}: has {p.subtitle_count} subtitle stream(s), which this script would drop")
+        if p.other_streams:
+            print(f"  note: {p.path.name}: ignoring {p.other_streams} non-A/V stream(s)")
+        if not p.audio_channels and len(probes) > 1:
+            raise Fail(f"{p.path.name}: no audio stream; cannot merge with audio from other files")
+
+    double = args.rate == "double"
+    modes, chains, scans = [], [], []
+    for p in probes:
+        scan = idet_scan(p)
+        mode = resolve_mode(p, scan, args.deint)
+        chain = deint_filters(mode, scan.order, double)
+        print(f"  {p.path.name}: {scan.verdict.value} (TFF {scan.tff} BFF {scan.bff} prog {scan.prog})"
+              f" -> {mode.value}{' ' + scan.order if chain else ''}")
+        modes.append(mode)
+        chains.append(chain)
+        scans.append(scan)
+
+    expected = sum(p.duration for p in probes)
+    in_bytes = sum(p.size for p in probes)
+    part = out.with_name(f".{out.stem}.part{out.suffix}")
+    part.unlink(missing_ok=True)
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y"]
+    if len(probes) == 1:
+        p = probes[0]
+        cmd += ["-i", str(p.path), "-map", "0:v:0", "-map", "0:a?",
+                "-af", "aresample=async=1:first_pts=0"]
+        if chains[0]:
+            cmd += ["-vf", ",".join(chains[0])]
+        ab = audio_bitrate(max(p.audio_channels, default=2), args.abitrate)
+    else:
+        first = probes[0]
+        if args.size:
+            W, H = parse_size(args.size)
+        else:
+            W, H = even(round(first.width * first.sar)), even(first.height)
+        fps = out_fps(first, modes[0], double)
+        rates = {out_fps(p, m, double) for p, m in zip(probes, modes)}
+        if len(rates) > 1:
+            print(f"  warning: inputs have different output frame rates "
+                  f"({', '.join(sorted(str(float(r)) for r in rates))}); "
+                  f"resampling all to {float(fps):.3f} fps (may judder)")
+        graph, labels = [], ""
+        for i, chain in enumerate(chains):
+            vf = chain + ["scale=trunc(iw*sar/2)*2:ih", "setsar=1",
+                          f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos",
+                          f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2",
+                          f"fps={fps.numerator}/{fps.denominator}", "setsar=1"]
+            graph.append(f"[{i}:v:0]{','.join(vf)}[v{i}]")
+            graph.append(f"[{i}:a:0]aresample=48000:async=1,aformat=channel_layouts=stereo[a{i}]")
+            labels += f"[v{i}][a{i}]"
+        graph.append(f"{labels}concat=n={len(probes)}:v=1:a=1[v][a]")
+        for p in probes:
+            cmd += ["-i", str(p.path)]
+        cmd += ["-filter_complex", ";".join(graph), "-map", "[v]", "-map", "[a]"]
+        ab = audio_bitrate(2, args.abitrate)
+        for i, p in enumerate(probes, 1):
+            print(f"    {i:2}. {p.path.name}")
+        print(f"  merging {len(probes)} inputs in the order given, at {W}x{H} {float(fps):.3f} fps, stereo audio")
+    cmd += encode_args(args, ab)
+    cmd += ["-map_chapters", "-1", str(part)]
+
+    try:
+        run_ffmpeg(cmd)
+        outp = verify(part, expected)
+        part.rename(out)
+    finally:
+        part.unlink(missing_ok=True)
+
+    ratio = outp.size / in_bytes
+    status = "OK" if ratio <= args.max_ratio else "LARGE"
+    return {"src": "+".join(str(p.path) for p in probes), "out": str(out),
+            "scan": "/".join(s.verdict.value for s in scans), "in": in_bytes, "outb": outp.size,
+            "ratio": ratio, "in_dur": expected, "out_dur": outp.duration, "status": status}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("inputs", nargs="+", type=Path)
+    ap.add_argument("--merge", action="store_true", help="concatenate all inputs (in the order given) into one output; needs -o")
+    ap.add_argument("-o", "--output", type=Path, help="output file (required with --merge)")
+    ap.add_argument("--outdir", type=Path, help="directory for outputs (default: next to each input)")
+    ap.add_argument("--crf", type=int, default=23, help="x265 CRF (default 23; lower = bigger/better; SD is fine at 22-25)")
+    ap.add_argument("--preset", default="slow", help="x265 preset (default slow)")
+    ap.add_argument("--deint", type=Deint, choices=list(Deint), default=Deint.AUTO,
+                    help="auto (default) stops on mixed material; or force a mode")
+    ap.add_argument("--rate", choices=["double", "single"], default="double",
+                    help="deinterlace to double rate (smooth motion, default) or single rate")
+    ap.add_argument("--8bit", dest="eight_bit", action="store_true",
+                    help="8-bit output (default is 10-bit: smaller, less banding, needs Main10 decode)")
+    ap.add_argument("--size", help="merge only: output WxH (default: first input's display size)")
+    ap.add_argument("--abitrate", help="AAC bitrate, e.g. 160k (default 64k per channel, max 384k)")
+    ap.add_argument("--max-ratio", type=float, default=0.7,
+                    help="flag outputs bigger than this fraction of the input (default 0.7)")
+    ap.add_argument("--threads", type=int, help="limit x265 to N threads (for running several encodes at once)")
+    ap.add_argument("--scan", action="store_true", help="only report interlacing for each input; encode nothing")
+    args = ap.parse_args()
+
+    for t in ("ffmpeg", "ffprobe"):
+        if not shutil.which(t):
+            sys.exit(f"{t} not found on PATH")
+    for f in args.inputs:
+        if not f.is_file():
+            sys.exit(f"not a file: {f}")
+    if args.merge and not args.output:
+        sys.exit("--merge needs -o OUTPUT")
+    if not args.merge and args.output and len(args.inputs) > 1:
+        sys.exit("-o with several inputs needs --merge")
+
+    if args.scan:
+        bad = 0
+        for f in args.inputs:
+            try:
+                p = probe(f)
+                s = idet_scan(p)
+                print(f"{s.verdict.value:12} TFF {s.tff:5} BFF {s.bff:5} prog {s.prog:5}  "
+                      f"{p.width}x{p.height} sar {p.sar} {float(p.fps):.3f}fps  {f}")
+            except Fail as e:
+                bad += 1
+                print(f"FAIL         {f}: {e}", file=sys.stderr)
+        sys.exit(1 if bad else 0)
+
+    try:
+        check_encoder(args.eight_bit)
+    except Fail as e:
+        sys.exit(str(e))
+
+    jobs = []
+    if args.merge:
+        jobs.append((args.inputs, args.output))
+    else:
+        for f in args.inputs:
+            if args.output:
+                out = args.output
+            else:
+                out = (args.outdir or f.parent) / (f.stem + ".mkv")
+            jobs.append(([f], out))
+
+    rows, failures = [], []
+    for srcs, out in jobs:
+        print(f"== {' + '.join(s.name for s in srcs)} -> {out}")
+        try:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            row = do_job(srcs, out, args)
+            rows.append(row)
+            print(f"  {row['status']}: {row['in'] / 1e6:.0f} MB -> {row['outb'] / 1e6:.0f} MB "
+                  f"({row['ratio']:.0%})")
+        except Fail as e:
+            failures.append((srcs, str(e)))
+            print(f"  FAIL: {e}", file=sys.stderr)
+
+    if rows:
+        log = rows and Path(rows[0]["out"]).parent / "hevc-encode.log.tsv"
+        with open(log, "a") as fh:
+            ts = datetime.datetime.now().isoformat(timespec="seconds")
+            for r in rows:
+                fh.write("\t".join(str(x) for x in (
+                    ts, r["status"], r["src"], r["out"], r["scan"], r["in"], r["outb"],
+                    f"{r['ratio']:.3f}", f"{r['in_dur']:.1f}", f"{r['out_dur']:.1f}")) + "\n")
+        print(f"\nlog: {log}")
+    large = [r for r in rows if r["status"] == "LARGE"]
+    print(f"\n{len(rows) - len(large)} ok, {len(large)} larger than {args.max_ratio:.0%} of input, "
+          f"{len(failures)} failed")
+    for r in large:
+        print(f"  LARGE ({r['ratio']:.0%}): {r['src']}")
+    for srcs, msg in failures:
+        print(f"  FAILED: {', '.join(s.name for s in srcs)}: {msg}", file=sys.stderr)
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == "__main__":
+    main()

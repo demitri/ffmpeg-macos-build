@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""hevc-queue: a filesystem job queue for hevc-encode, run several encodes in parallel.
+
+  hevc-queue add *.mpg                    # from any directory; outputs land next to the inputs
+  hevc-queue add --merge --natural -o ep.mkv 'A vid'*.mpg   # shows the order, asks to confirm
+  hevc-queue add -x "--crf 21 --8bit" *.wmv       # extra hevc-encode options, quoted
+  hevc-queue run                          # start the worker (one per queue); stays alive for new jobs
+  hevc-queue run --once                   # exit when the queue is empty
+  hevc-queue status [-a]
+  hevc-queue set -j 3 -t 10               # change parallel jobs / x265 threads per job, live
+  hevc-queue pause | resume               # stop/start launching new jobs (running ones finish)
+  hevc-queue cancel [ID... | --all]       # remove pending jobs
+  hevc-queue retry [-x "opts"] [ID...]   # failed -> pending (all if no ID); -x replaces its options
+
+Paths are made absolute at `add` time, so you can cd around and submit from anywhere.
+Queue lives in $HEVC_QUEUE (default ~/hevc-queue):
+  pending/ running/ done/ failed/   one JSON file per job;  logs/<id>.log   full output per job.
+Nothing is ever deleted by this tool: not inputs, not outputs, not job records (except `cancel`).
+"""
+import argparse
+import datetime
+import enum
+import fcntl
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+QUEUE = Path(os.environ.get("HEVC_QUEUE", Path.home() / "hevc-queue"))
+ENCODER = Path(__file__).resolve().parent / "hevc-encode"
+FORBIDDEN_EXTRA = {"-o", "--output", "--outdir", "--merge", "--scan", "--threads"}
+
+
+class State(enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    FAILED = "failed"
+
+
+def die(msg):
+    sys.exit(f"hevc-queue: {msg}")
+
+
+def sdir(state):
+    p = QUEUE / state.value
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def logdir():
+    p = QUEUE / "logs"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def write_json(path, obj):
+    tmp = path.with_name("." + path.name + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=1))
+    tmp.rename(path)
+
+
+def jobs_in(state):
+    return [(f, json.loads(f.read_text())) for f in sorted(sdir(state).glob("*.json"))]
+
+
+def default_config():
+    cpu = os.cpu_count() or 8
+    jobs = max(1, min(4, cpu // 8))
+    return {"jobs": jobs, "threads": max(2, cpu // jobs)}
+
+
+def load_config():
+    f = QUEUE / "config.json"
+    if not f.exists():
+        QUEUE.mkdir(parents=True, exist_ok=True)
+        write_json(f, default_config())
+    return json.loads(f.read_text())
+
+
+def update_config(jobs, threads):
+    cfg = load_config()
+    if jobs:
+        cfg["jobs"] = jobs
+    if threads:
+        cfg["threads"] = threads
+    write_json(QUEUE / "config.json", cfg)
+    return cfg
+
+
+def next_seq():
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    with open(QUEUE / "seq.lock", "a+") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        sf = QUEUE / "seq"
+        n = (int(sf.read_text()) if sf.exists() else 0) + 1
+        sf.write_text(str(n))
+        return n
+
+
+def duration_of(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        die(f"ffprobe cannot read {path}: {r.stderr.strip()[-300:]}")
+    return float(r.stdout.strip())
+
+
+# ---------------------------------------------------------------- add
+
+def cmd_add(a):
+    extra = shlex.split(a.x or "")
+    bad = FORBIDDEN_EXTRA & set(extra)
+    if bad:
+        die(f"{sorted(bad)} are set by the queue; do not pass them in -x")
+    inputs = [Path(os.path.abspath(p)) for p in a.inputs]
+    for p in inputs:
+        if not p.is_file():
+            die(f"not a file: {p}")
+    if a.merge and not a.output:
+        die("--merge needs -o OUTPUT")
+    if not a.merge and a.output and len(inputs) > 1:
+        die("-o with several inputs needs --merge")
+    outdir = Path(os.path.abspath(a.outdir)) if a.outdir else None
+    if a.merge:
+        if a.natural:
+            inputs.sort(key=lambda p: [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", p.name)])
+        print("merge order:")
+        for i, p in enumerate(inputs, 1):
+            print(f"  {i:2}. {p.name}")
+        if not a.yes:
+            if not sys.stdin.isatty():
+                die("merge order needs confirmation: run on a terminal, or pass -y after checking the order")
+            if input("proceed with this order? [y/N] ").strip().lower() != "y":
+                die("aborted; nothing queued (use --natural to sort numerically, or list files explicitly)")
+
+    plan = []
+    if a.merge:
+        plan.append((inputs, Path(os.path.abspath(a.output))))
+    else:
+        for p in inputs:
+            out = Path(os.path.abspath(a.output)) if a.output else (outdir or p.parent) / (p.stem + ".mkv")
+            plan.append(([p], out))
+
+    for _, out in plan:
+        if out.suffix.lower() not in (".mkv", ".mp4", ".m4v"):
+            die(f"output {out.name}: extension must be .mkv, .mp4 or .m4v (HEVC+AAC cannot go in {out.suffix or 'a file with no extension'})")
+    active_in, active_out = set(), set()
+    for state in (State.PENDING, State.RUNNING):
+        for _, j in jobs_in(state):
+            active_in.update(j["inputs"])
+            active_out.add(j["output"])
+    seen_out = set()
+    for srcs, out in plan:
+        dup = [str(s) for s in srcs if str(s) in active_in]
+        if dup:
+            die(f"already queued or running: {dup[0]}")
+        if out.exists():
+            die(f"output already exists: {out}")
+        if str(out) in active_out or str(out) in seen_out:
+            die(f"another job already writes {out}")
+        seen_out.add(str(out))
+
+    for srcs, out in plan:
+        seq = next_seq()
+        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", srcs[0].stem)[:40]
+        job = {"id": f"{seq:05d}", "created": datetime.datetime.now().isoformat(timespec="seconds"),
+               "cwd": os.getcwd(), "inputs": [str(s) for s in srcs], "output": str(out),
+               "merge": a.merge, "extra": extra, "duration": sum(duration_of(s) for s in srcs)}
+        write_json(sdir(State.PENDING) / f"{job['id']}-{safe}.json", job)
+        print(f"queued {job['id']}: {' + '.join(s.name for s in srcs)} -> {out}")
+
+
+# ---------------------------------------------------------------- worker
+
+def claim():
+    for f in sorted(sdir(State.PENDING).glob("*.json")):
+        dest = sdir(State.RUNNING) / f.name
+        try:
+            os.rename(f, dest)
+        except FileNotFoundError:
+            continue
+        return dest
+    return None
+
+
+def stamp():
+    return datetime.datetime.now().strftime("%H:%M:%S")
+
+
+def tail(path, n):
+    with open(path, "rb") as fh:
+        fh.seek(0, os.SEEK_END)
+        fh.seek(max(0, fh.tell() - n))
+        return fh.read().decode("utf-8", "replace")
+
+
+def spawn(jobfile, threads):
+    job = json.loads(jobfile.read_text())
+    cmd = [sys.executable, str(ENCODER), "--threads", str(threads)] + job["extra"]
+    if job["merge"]:
+        cmd.append("--merge")
+    cmd += ["-o", job["output"]] + job["inputs"]
+    log = open(logdir() / f"{job['id']}.log", "ab")
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            start_new_session=True)
+    return proc, job
+
+
+def finish(jobfile, job, rc, started):
+    log = logdir() / f"{job['id']}.log"
+    job.update(rc=rc, finished=datetime.datetime.now().isoformat(timespec="seconds"),
+               seconds=round(time.time() - started))
+    job["large"] = bool(re.search(r"^  LARGE", tail(log, 8192), re.M))
+    state = State.DONE if rc == 0 else State.FAILED
+    write_json(sdir(state) / jobfile.name, job)
+    jobfile.unlink()
+    print(f"[{stamp()}] {state.value.upper()} {job['id']} {Path(job['inputs'][0]).name}"
+          f"{' (LARGE output)' if job['large'] else ''}", flush=True)
+
+
+def killgroup(proc, sig):
+    try:
+        os.killpg(proc.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def cmd_run(a):
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    lock = open(QUEUE / "worker.lock", "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        die("another worker already holds this queue")
+    update_config(a.jobs, a.threads)
+    for f in sorted(sdir(State.RUNNING).glob("*.json")):  # stale: only one worker exists
+        os.rename(f, sdir(State.PENDING) / f.name)
+        print(f"[{stamp()}] recovered interrupted job {f.name}")
+
+    slots = {}  # jobfile -> (proc, job, started)
+    stop = []
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    cfg = load_config()
+    print(f"[{stamp()}] worker up: {cfg['jobs']} parallel x {cfg['threads']} threads; queue {QUEUE}", flush=True)
+    while not stop:
+        for jf, (proc, job, started) in list(slots.items()):
+            rc = proc.poll()
+            if rc is not None:
+                finish(jf, job, rc, started)
+                del slots[jf]
+        cfg = load_config()
+        paused = (QUEUE / "PAUSED").exists()
+        while not paused and len(slots) < cfg["jobs"] and not stop:
+            jf = claim()
+            if jf is None:
+                break
+            proc, job = spawn(jf, cfg["threads"])
+            slots[jf] = (proc, job, time.time())
+            print(f"[{stamp()}] start {job['id']} {Path(job['inputs'][0]).name}", flush=True)
+        if a.once and not slots and not list(sdir(State.PENDING).glob("*.json")):
+            break
+        time.sleep(1)
+
+    if slots:
+        print(f"[{stamp()}] stopping: interrupting {len(slots)} running job(s), returning them to pending", flush=True)
+        for proc, _, _ in slots.values():
+            killgroup(proc, signal.SIGINT)
+        deadline = time.time() + 30
+        for jf, (proc, _, _) in slots.items():
+            try:
+                proc.wait(timeout=max(1, deadline - time.time()))
+            except subprocess.TimeoutExpired:
+                killgroup(proc, signal.SIGKILL)
+                proc.wait()
+            os.rename(jf, sdir(State.PENDING) / jf.name)
+
+
+# ---------------------------------------------------------------- status & control
+
+def progress(job):
+    log = logdir() / f"{job['id']}.log"
+    if not log.exists():
+        return "starting"
+    t = tail(log, 6000)
+    tm = re.findall(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", t)
+    sp = re.findall(r"speed=\s*([\d.]+)x", t)
+    if not tm:
+        return "scanning"
+    h, m, s = tm[-1]
+    done = int(h) * 3600 + int(m) * 60 + float(s)
+    pct = min(100, 100 * done / job["duration"]) if job["duration"] else 0
+    eta = ""
+    if sp and float(sp[-1]) > 0:
+        eta = f", ETA {int((job['duration'] - done) / float(sp[-1]) / 60)} min"
+    return f"{pct:.0f}%  {sp[-1] + 'x' if sp else ''}{eta}"
+
+
+def label(job):
+    n = Path(job["inputs"][0]).name
+    return n + (f" (+{len(job['inputs']) - 1} merged)" if len(job["inputs"]) > 1 else "")
+
+
+def cmd_status(a):
+    cfg = load_config()
+    state_txt = "PAUSED" if (QUEUE / "PAUSED").exists() else "active"
+    pend, run, done, fail = (jobs_in(s) for s in State)
+    print(f"queue {QUEUE} [{state_txt}]  config: {cfg['jobs']} parallel x {cfg['threads']} threads")
+    print(f"{len(pend)} pending, {len(run)} running, {len(done)} done, {len(fail)} failed\n")
+    for _, j in run:
+        print(f"  RUNNING {j['id']}  {progress(j):28} {label(j)}")
+    lim = None if a.all else 10
+    for _, j in pend[:lim]:
+        print(f"  pending {j['id']}  {label(j)}")
+    if lim and len(pend) > lim:
+        print(f"  ... {len(pend) - lim} more pending (status -a)")
+    for _, j in fail:
+        lt = tail(logdir() / f"{j['id']}.log", 4000).strip().splitlines()
+        why = next((x.strip() for x in reversed(lt) if "FAIL" in x), "see log")
+        print(f"  FAILED  {j['id']}  {label(j)}\n          {why[:200]}\n          log: {logdir() / (j['id'] + '.log')}")
+    for _, j in (done if a.all else done[-5:]):
+        print(f"  done    {j['id']}  {label(j)}{'  ** LARGE output **' if j.get('large') else ''}")
+
+
+def pick(state, ids, all_flag):
+    items = jobs_in(state)
+    if all_flag or not ids:
+        if not all_flag and state is State.PENDING:
+            die("give job IDs, or --all")
+        return items
+    out = []
+    for i in ids:
+        m = [(f, j) for f, j in items if j["id"].lstrip("0") == i.lstrip("0")]
+        if not m:
+            die(f"no {state.value} job with id {i}")
+        out += m
+    return out
+
+
+def cmd_cancel(a):
+    for f, j in pick(State.PENDING, a.ids, a.all):
+        f.unlink()
+        print(f"cancelled {j['id']}: {label(j)}")
+
+
+def cmd_retry(a):
+    for f, j in pick(State.FAILED, a.ids, False):
+        if a.x is not None:
+            extra = shlex.split(a.x)
+            if FORBIDDEN_EXTRA & set(extra):
+                die(f"{sorted(FORBIDDEN_EXTRA & set(extra))} are set by the queue; do not pass them in -x")
+            j["extra"] = extra
+        write_json(sdir(State.PENDING) / f.name, j)
+        f.unlink()
+        print(f"requeued {j['id']}: {label(j)}")
+
+
+def cmd_pause(a):
+    QUEUE.mkdir(parents=True, exist_ok=True)
+    (QUEUE / "PAUSED").touch()
+    print("paused: running jobs finish, no new ones start")
+
+
+def cmd_resume(a):
+    (QUEUE / "PAUSED").unlink(missing_ok=True)
+    print("resumed")
+
+
+def cmd_set(a):
+    cfg = update_config(a.jobs, a.threads)
+    print(f"config: {cfg['jobs']} parallel x {cfg['threads']} threads (takes effect for jobs started from now)")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("add")
+    p.add_argument("inputs", nargs="+")
+    p.add_argument("--merge", action="store_true")
+    p.add_argument("-o", "--output")
+    p.add_argument("--outdir")
+    p.add_argument("--natural", action="store_true", help="merge: sort inputs numerically (vid 2 before vid 10)")
+    p.add_argument("-y", "--yes", action="store_true", help="merge: skip the order confirmation")
+    p.add_argument("-x", help='extra hevc-encode options as one quoted string, e.g. -x "--crf 21 --8bit"')
+    p.set_defaults(fn=cmd_add)
+    p = sub.add_parser("run")
+    p.add_argument("-j", "--jobs", type=int)
+    p.add_argument("-t", "--threads", type=int)
+    p.add_argument("--once", action="store_true")
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("status")
+    p.add_argument("-a", "--all", action="store_true")
+    p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("cancel")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(fn=cmd_cancel)
+    p = sub.add_parser("retry")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("-x", help="replace the job's extra hevc-encode options, e.g. -x \"--deint progressive\"")
+    p.set_defaults(fn=cmd_retry)
+    sub.add_parser("pause").set_defaults(fn=cmd_pause)
+    sub.add_parser("resume").set_defaults(fn=cmd_resume)
+    p = sub.add_parser("set")
+    p.add_argument("-j", "--jobs", type=int)
+    p.add_argument("-t", "--threads", type=int)
+    p.set_defaults(fn=cmd_set)
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

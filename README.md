@@ -208,3 +208,7 @@ OpenSSL >= 3.0 is GPL-compatible in FFmpeg 9.0 (only `< 3.0.0` requires
   least the equal of `libfdk_aac` on this hardware. Worth A/B testing.
 - **The M1 has no hardware AV1 decoder** (that arrived with M3), so AV1 playback
   is software via `libdav1d`.
+
+## Scripts
+
+`scripts/` has `hevc-encode` (HEVC re-encoder with interlace detection and merging), `hevc-queue` (parallel job queue for it) and bash completion. See [scripts/README.md](scripts/README.md).
