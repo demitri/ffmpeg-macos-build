@@ -20,6 +20,7 @@ import argparse
 import datetime
 import enum
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -334,6 +335,7 @@ def main():
     ap.add_argument("--threads", type=int, help="limit x265 to N threads (for running several encodes at once)")
     ap.add_argument("--scan", action="store_true", help="only report interlacing for each input; encode nothing")
     args = ap.parse_args()
+    args.inputs = [Path(os.path.abspath(p)) for p in args.inputs]  # a leading '-' must never reach ffmpeg as an option
 
     for t in ("ffmpeg", "ffprobe"):
         if not shutil.which(t):
